@@ -7,12 +7,24 @@ const axios = require('axios');
 const cors = require('cors');
 const morgan = require('morgan');
 
+// 🔹 NEW: auth & DB imports
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+
+// 🔹 NEW: User model (schema in models/User.js)
+const User = require('./modles/user');
+
 const app = express();
 const PORT = process.env.PORT || 4000;
 
 /* =============== CONFIG =============== */
 // Replace with your key
-const GEMINI_API_KEY = "AIzaSyCQYD_dGBhSOZIAGrKEjVCs3ko1S86Ndns";
+const GEMINI_API_KEY = "AIzaSyDDVeMLZo40T-q89aDrmxPJDF1sc5ZVal0";
+
+// 🔹 NEW: Mongo + JWT config
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/ai_dashboard';
+const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-key-change-this';
 
 if (!GEMINI_API_KEY) {
   console.warn('⚠️ GEMINI_API_KEY is empty. Please set your key in server.gemini.smart.js');
@@ -21,6 +33,15 @@ if (!GEMINI_API_KEY) {
 app.use(cors());
 app.use(express.json({ limit: '12mb' }));
 app.use(morgan('dev'));
+
+// 🔹 NEW: Connect to MongoDB
+mongoose
+  .connect(MONGO_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+  })
+  .then(() => console.log('✅ MongoDB connected:', MONGO_URI))
+  .catch((err) => console.error('❌ MongoDB connection error:', err.message));
 
 const axiosJSON = axios.create({
   timeout: 60_000,
@@ -207,6 +228,91 @@ function extractRetrySecondsFromApiError(apiErr) {
   }
   return null;
 }
+
+/* =============== AUTH ROUTES (Login / Signup) =============== */
+
+// POST /api/auth/signup
+app.post('/api/auth/signup', async (req, res) => {
+  try {
+    const { name, email, password } = req.body || {};
+
+    if (!name || !email || !password) {
+      return res.status(400).json({ error: 'name, email and password are required' });
+    }
+
+    const existing = await User.findOne({ email: email.toLowerCase().trim() });
+    if (existing) {
+      return res.status(409).json({ error: 'User already exists with this email' });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    const user = await User.create({
+      name: name.trim(),
+      email: email.toLowerCase().trim(),
+      passwordHash,
+    });
+
+    const token = jwt.sign(
+      { id: user._id, email: user.email },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    return res.json({
+      message: 'Signup successful',
+      token,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+      },
+    });
+  } catch (err) {
+    console.error('Signup error:', err);
+    return res.status(500).json({ error: 'signup_failed', message: String(err.message || err) });
+  }
+});
+
+// POST /api/auth/login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'email and password are required' });
+    }
+
+    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    const ok = await bcrypt.compare(password, user.passwordHash);
+    if (!ok) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    const token = jwt.sign(
+      { id: user._id, email: user.email },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    return res.json({
+      message: 'Login successful',
+      token,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+      },
+    });
+  } catch (err) {
+    console.error('Login error:', err);
+    return res.status(500).json({ error: 'login_failed', message: String(err.message || err) });
+  }
+});
 
 /* =============== Chat endpoint =============== */
 app.post('/api/chat', async (req, res) => {
