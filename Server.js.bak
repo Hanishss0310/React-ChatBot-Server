@@ -1,0 +1,251 @@
+// Server.js
+// Express backend for Gemini Chat + Fal Video Generation
+// NOTE: You asked to hardcode keys. Paste them into the constants below.
+// Do NOT commit this file to a public repository.
+
+const express = require('express');
+const axios = require('axios');
+const cors = require('cors');
+const morgan = require('morgan');
+
+const app = express();
+const PORT = process.env.PORT || 4000;
+
+/* =====================================================
+   <-- HARD-CODE YOUR KEYS HERE (you asked for this) -->
+   Replace the empty strings with your real keys.
+   Example:
+     const GEMINI_API_KEY = "AIza...yourgeminikey...";
+     const FAL_API_KEY    = "sk-abcdef0123456789";
+   ===================================================== */
+const GEMINI_API_KEY = ""; // <-- paste your Gemini API key here (string)
+const FAL_API_KEY = "5627612d-6d90-4e7e-b9d2-290216bf7fc7:8f9ef1fdf2fc6bf2cf60e9fc516f254a";    // <-- paste your Fal / Luma API key here (string)
+/* ===================================================== */
+// ======= Diagnostic block (safe) =======
+function maskKeySafe(key) {
+  if (!key) return null;
+  const s = String(key);
+  return `${s.slice(0,6)}***** (len=${s.length})`;
+}
+
+const falTokenRaw = typeof FAL_API_KEY !== 'undefined' ? String(FAL_API_KEY) : '';
+console.log('FAL_API_KEY present?', !!falTokenRaw, 'masked:', maskKeySafe(falTokenRaw));
+console.log('FAL_API_KEY contains colon ":"?', falTokenRaw.includes(':'));
+console.log('FAL_API_KEY contains whitespace?', /\s/.test(falTokenRaw));
+console.log('FAL_API_KEY starts with "Bearer"?', falTokenRaw.trim().toLowerCase().startsWith('bearer'));
+
+/* -------------------------
+   Safe masking utility for logs (does NOT expose secret)
+   ------------------------- */
+function maskKeySafe(key) {
+  if (!key) return null;
+  const s = String(key).trim();
+  const head = s.slice(0, 6);
+  return `${head}***** (len=${s.length})`;
+}
+
+console.log('GEMINI_API_KEY present?', !!GEMINI_API_KEY, 'masked:', maskKeySafe(GEMINI_API_KEY));
+console.log('FAL_API_KEY present?', !!FAL_API_KEY, 'masked:', maskKeySafe(FAL_API_KEY));
+
+// Middlewares
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+app.use(morgan('dev'));
+
+// Axios instances
+const axiosGemini = axios.create({ timeout: 25_000, headers: { 'Content-Type': 'application/json' } });
+const axiosFal = axios.create({ timeout: 30_000, headers: { 'Content-Type': 'application/json' } });
+
+// Helpers
+function formatAxiosError(err) {
+  if (!err) return null;
+  if (err.response) {
+    return { status: err.response.status, data: err.response.data };
+  }
+  if (err.request) {
+    return { message: 'No response received from remote host' };
+  }
+  return { message: err.message };
+}
+function parseRetrySecondsFromMessage(msg) {
+  if (!msg || typeof msg !== 'string') return null;
+  const m = msg.match(/Please retry in\s*([0-9.]+)s/i);
+  if (m && m[1]) return Number(m[1]);
+  return null;
+}
+
+/* ====================================================
+   Health
+   ==================================================== */
+app.get('/_health', (_, res) => res.json({ ok: true, time: new Date().toISOString(), pid: process.pid }));
+
+/* ====================================================
+   Chat endpoint -> Gemini
+   Expects: { messages: [{ role, text }, ...] }
+   ==================================================== */
+app.post('/api/chat', async (req, res) => {
+  try {
+    const { messages = [] } = req.body || {};
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: 'messages array required' });
+    }
+
+    // Fallback / echo mode if no key provided
+    if (!GEMINI_API_KEY || GEMINI_API_KEY.includes('PASTE_YOUR')) {
+      const last = messages[messages.length - 1] || {};
+      const reply = `Echo (fallback): I received your message: "${String(last.text || '')}". Set GEMINI_API_KEY in Server.js to call Gemini.`;
+      return res.json({ text: reply, fallback: true });
+    }
+
+    const systemPrompt = 'You are a helpful assistant. Respond in clean plain text with spacing and bullet points.';
+    const history = messages.map(m => `${m.role || 'user'}: ${m.text || ''}`).join('\n\n');
+
+    const payload = {
+      contents: [{ parts: [{ text: `${systemPrompt}\n\n${history}` }] }],
+      generationConfig: { temperature: 0.2, maxOutputTokens: 512 }
+    };
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${String(GEMINI_API_KEY).trim()}`;
+
+    const response = await axiosGemini.post(url, payload);
+    const data = response?.data || {};
+    const output = data?.candidates?.[0]?.content?.parts?.[0]?.text || null;
+
+    if (!output) {
+      return res.status(502).json({ error: 'no_gemini_output', raw: data });
+    }
+
+    return res.json({ text: output, raw: data });
+  } catch (err) {
+    const formatted = formatAxiosError(err);
+    console.error('Gemini Error:', formatted);
+
+    const status = err?.response?.status || 500;
+    if (status === 429) {
+      const messageText = err?.response?.data?.error?.message || JSON.stringify(err?.response?.data || err);
+      const retrySecs = parseRetrySecondsFromMessage(String(messageText));
+      return res.status(429).json({
+        error: 'gemini_quota_exceeded',
+        message: 'Gemini quota exceeded — check billing/plan',
+        details: err?.response?.data,
+        retryAfterSeconds: retrySecs || undefined
+      });
+    }
+
+    return res.status(500).json({ error: 'gemini_error', details: formatted });
+  }
+});
+
+/* ====================================================
+   Submit Video Job -> Fal
+   Expects: { modelPath, input }
+   ==================================================== */
+app.post('/api/video', async (req, res) => {
+  try {
+    const { modelPath, input } = req.body || {};
+    if (!modelPath || !input) {
+      return res.status(400).json({
+        error: 'modelPath_and_input_required',
+        example: { modelPath: 'fal-ai/veo3/fast', input: { prompt: 'A dragon flying', lengthSeconds: 6 } }
+      });
+    }
+
+    // Demo fallback if key missing
+    if (!FAL_API_KEY || FAL_API_KEY.includes('PASTE_YOUR')) {
+      return res.json({
+        status: 'demo',
+        url: 'https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4',
+        message: 'No FAL_API_KEY configured in Server.js — demo video returned'
+      });
+    }
+
+    // Clean modelPath and token
+    const cleanedModelPath = String(modelPath).replace(/^\/+|\/+$/g, '');
+    const token = String(FAL_API_KEY).trim();
+
+    const url = `https://queue.fal.run/${cleanedModelPath}`;
+    const headers = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`
+    };
+
+    const response = await axiosFal.post(url, { input }, { headers });
+    return res.json({ job: response.data });
+  } catch (err) {
+    const formatted = formatAxiosError(err);
+    console.error('FAL Submit Error:', formatted);
+
+    const status = err?.response?.status || 500;
+    if (status === 401 || status === 403) {
+      return res.status(401).json({ error: 'fal_invalid_token', message: 'FAL API token invalid or unauthorized', details: err?.response?.data });
+    }
+    return res.status(500).json({ error: 'fal_submit_error', details: formatted });
+  }
+});
+
+/* ====================================================
+   Video job status -> Fal
+   Query: modelPath, requestId
+   ==================================================== */
+app.get('/api/video/status', async (req, res) => {
+  try {
+    const { modelPath, requestId } = req.query || {};
+    if (!modelPath || !requestId) {
+      return res.status(400).json({ error: 'modelPath_and_requestId_required', example: '/api/video/status?modelPath=fal-ai/veo3/fast&requestId=abc123' });
+    }
+
+    if (!FAL_API_KEY || FAL_API_KEY.includes('PASTE_YOUR')) {
+      return res.status(500).json({ error: 'missing_fal_key' });
+    }
+
+    const cleanedModelPath = String(modelPath).replace(/^\/+|\/+$/g, '');
+    const token = String(FAL_API_KEY).trim();
+    const url = `https://queue.fal.run/${cleanedModelPath}/requests/${encodeURIComponent(String(requestId))}`;
+
+    const response = await axios.get(url, { headers: { Authorization: `Bearer ${token}` } });
+    return res.json({ status: response.data });
+  } catch (err) {
+    const formatted = formatAxiosError(err);
+    console.error('FAL Status Error:', formatted);
+    return res.status(err?.response?.status || 500).json({ error: 'fal_status_error', details: formatted });
+  }
+});
+
+/* ====================================================
+   Safe /api 404 fallback (use '/api' not '/api/*')
+   ==================================================== */
+app.use('/api', (req, res, next) => {
+  if (req.path && req.path !== '/') {
+    return res.status(404).json({ error: 'api_route_not_found', path: req.originalUrl });
+  }
+  return next();
+});
+
+// generic 404 for everything else
+app.use((req, res) => {
+  res.status(404).send('Not Found');
+});
+
+/* ====================================================
+   Process handlers
+   ==================================================== */
+process.on('uncaughtException', (err) => {
+  console.error('❌ Uncaught Exception:', err && err.stack ? err.stack : err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('❌ Unhandled Rejection:', reason);
+});
+
+/* ====================================================
+   Start server
+   ==================================================== */
+const server = app.listen(PORT, () => {
+  console.log(`Backend running: http://localhost:${PORT}`);
+});
+
+function shutdown(sig) {
+  console.info(`Received ${sig}, shutting down...`);
+  server.close(() => process.exit(0));
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
